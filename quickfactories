@@ -1,0 +1,175 @@
+#!/usr/bin/env ruby
+
+def prompt(*args)
+    print(*args)
+    gets
+end
+
+def ask(*args)
+  response = prompt(*args)
+  response.downcase!
+  response.strip!
+  return response =~ /[jy]|ja|yes/
+end
+
+def ask_overwrite(file)
+  file_exists = File.exists?(file)
+  if file_exists == true
+    return ask "File exists? Overwrite? (y/N)"
+  end
+  return true
+end
+
+def init_bundler
+  bundle_need  = false
+  puts "Checking bundle for needed gems"
+  check_gem = `bundle list --no-color`
+  needed_gems = ['factory_girl_rails', 'ffaker']
+  needed_gems.each do |gem_name|
+    unless check_gem.include?(gem_name)
+      # Need to add the factory_girl gem first
+      File.open('Gemfile', 'a') do |file|
+        file.puts ''
+        file.puts "gem '#{gem_name}', group: :test"
+      end
+      puts "  Added #{gem_name} gem"
+      bundle_need = true
+    end
+  end
+  puts "bundle_need: #{bundle_need}"
+  `bundle install` if bundle_need  
+end
+
+def init_factory_girl
+  puts "Checking for factory_girl init"
+  do_init_factory_girl = false
+  if File.exists?("./spec/support/factory_girl.rb")
+    do_init_factory_girl = ask "File found, should we overwrite? (y/N)"
+  else
+    do_init_factory_girl = true
+  end
+
+  # Check rspec for needed file
+  if do_init_factory_girl
+    file = File.new("./spec/support/factory_girl.rb", File::CREAT|File::TRUNC|File::RDWR, 0644)
+    file.puts <<-RUBY
+  RSpec.configure do |config|
+    config.include FactoryGirl::Syntax::Methods
+    # additional factory_girl configuration
+
+    config.before(:suite) do
+      begin
+        DatabaseCleaner.start
+        FactoryGirl.lint
+      ensure
+        DatabaseCleaner.clean
+      end
+    end
+  end
+  RUBY
+    file.close
+  end
+end
+
+def generate_factories
+  # Okay, now create the files needed....
+  require './config/environment.rb'
+  files = Dir.glob('./app/models/*.rb')
+  # Stupidly assume all under models must be a model...
+  files.each do |f|
+    name = f.split('/').last.gsub('.rb','')
+    if name =~ /ability/i
+      puts "Skipping ability file!"
+      next
+    end
+    if ask_overwrite("./spec/factories/#{name.pluralize}.rb")
+      puts "Creating a factory for a #{name}"
+      file = File.new("./spec/factories/#{name.pluralize}.rb", File::CREAT|File::TRUNC|File::RDWR, 0644)
+      obj = name.camelize.constantize
+      file.puts "FactoryGirl.define do"
+      file.puts <<-RUBY
+  factory :#{name} do
+#{factory_attributes(obj, name).gsub(/^/, "    ")}
+  end
+end
+  RUBY
+      file.close
+    else
+      puts "The factory for a #{name} exists, skipping..."
+    end
+  end
+end
+
+def factory_attributes(obj, name)
+  # Generate a string overview of needed attributes
+  # We don't need the fields with a id
+  columns = obj.columns.delete_if{|col| col.name =~ /id$/}
+  attributes = []
+  sub_factories = []
+
+  # Step over the columns and add to the attributes for factory
+  columns.each do |col|
+    case col.type
+    when :string
+      # Determin subtype
+      if col.name =~ /email/i
+        attributes << "#{col.name} { FFaker::Internet.email }"
+        next
+      end
+      if col.name =~ /_ip$|ip_adress$/i
+        attributes << "#{col.name} { FFaker::Internet.ip_v4_address }"
+        next
+      end
+      if col.name =~ /_url$/i
+        attributes << "#{col.name} { FFaker::Internet.http_url }"
+        next
+      end
+      next if col.name =~ /token$|content_type$|file/
+
+      attributes << "#{col.name} { FFaker::Lorem.phrase }"
+    when :integer
+      next if col.name =~ /file_size$/
+      attributes << "#{col.name} { rand(99) }"
+    when :float
+      attributes << "#{col.name} { rand + rand(6) }"
+    when :date, :datetime
+      next if col.name =~ /_at$/i
+      attributes << "#{col.name} { FFaker::Time.date }"
+    when :boolean
+      attributes << "#{col.name} { true }"
+    else
+      attributes << "# #{col.name} TODO unknown field #{col.name} !"
+    end
+  end
+
+  # Map all attributes
+  obj.reflections.each{|key, val|
+    #assoc kind e.d.
+    assoc = obj.reflections[key]
+    case assoc.macro
+    when :has_many
+      next if name == key #ignore self ref!
+      sub_factories << <<-RUBY
+  factory :#{name}_with_#{key.to_s} do
+    transient do
+      #{key}_count 3
+    end
+
+    after(:create) do |#{name}, evaluator|
+      FactoryGirl.create_list(:#{key.to_s.singularize}, evaluator.#{key.to_s}_count, #{key.to_s.singularize}: #{key.to_s.singularize.camelize})
+    end
+  end
+RUBY
+    when :has_one, :belongs_to
+      attributes << key
+    end
+  }
+  # We need to add the subfactories as wel
+  attributes << sub_factories.join("\n").strip
+  return attributes.join("\n")
+end
+
+# now execute the code above
+init_bundler
+init_factory_girl
+generate_factories

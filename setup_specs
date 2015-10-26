@@ -1,0 +1,312 @@
+#!/usr/bin/env ruby
+$stdout.sync = true
+
+def prompt(*args)
+    print(*args)
+    STDIN.gets
+end
+
+def ask(*args)
+  response = prompt(*args)
+  response.downcase!
+  response.strip!
+  return response =~ /[jy]|ja|yes/i
+end
+
+def ask_overwrite(file)
+  file_exists = File.exists?(file)
+  if file_exists == true
+    return ask "File #{file} exists. Overwrite? (y/N)"
+  end
+  return true
+end
+
+def the_current_gems
+  @current_gems ||= `bundle list --no-color`
+end
+
+def check_add_to_bundle(name, version = nil, groups = nil)
+  return false if the_current_gems.include?(name)
+  line = "gem '#{name}'"
+  if version
+    line << ", '#{version}'"
+  end
+  if groups
+    line << ", group: [#{groups}]"
+  end
+  puts "Adding #{line} to Gemfile"
+  File.open('Gemfile', 'a') do |file|
+    file.puts if gemfile_need_newline
+    file.puts line
+  end
+  return true
+end
+
+def gemfile_need_newline
+  return false if @gemfile_newline_checked == true
+  l = ''
+  open('Gemfile').each_line{|line| l = line}
+  @gemfile_newline_checked = true
+  return l.empty? == false
+end
+
+def init_bundler_rspec
+  puts "Checking bundle for needed gems -> RSpec"
+  @bundle_need = true if check_add_to_bundle 'rspec-rails', nil, ':development, :test'
+  @bundle_need = true if check_add_to_bundle 'shoulda-matchers', nil, ':test'
+end
+
+def init_bundler_fg
+  puts "Checking bundle for needed gems -> FactoryGirl"
+  @bundle_need = true if check_add_to_bundle 'factory_girl_rails', '~> 4.0', ':test'
+  @bundle_need = true if check_add_to_bundle 'ffaker', nil, ':test'
+end
+
+def init_factory_girl
+  puts "Checking for factory_girl init"
+  do_init_factory_girl = false
+  if ask_overwrite("./spec/support/factory_girl.rb")
+    do_init_factory_girl = true
+  end
+
+  # Check rspec for needed file
+  if do_init_factory_girl
+    file = File.new("./spec/support/factory_girl.rb", File::CREAT|File::TRUNC|File::RDWR, 0644)
+    file.puts <<-RUBY
+  RSpec.configure do |config|
+    config.include FactoryGirl::Syntax::Methods
+    # additional factory_girl configuration
+
+    config.before(:suite) do
+      begin
+        DatabaseCleaner.start
+        FactoryGirl.lint
+      ensure
+        DatabaseCleaner.clean
+      end
+    end
+  end
+  RUBY
+    file.close
+  end
+end
+
+def generate_factories
+  # Okay, now create the files needed....
+  files = Dir.glob('./app/models/*.rb')
+  # Stupidly assume all under models must be a model...
+  files.each do |f|
+    name = f.split('/').last.gsub('.rb','')
+    if name =~ /ability/i
+      puts "Skipping ability file!"
+      next
+    end
+    if ask_overwrite("./spec/factories/#{name.pluralize}.rb")
+      m = name.camelize.constantize
+      if m.respond_to?(:descends_from_active_record?) == false || m.descends_from_active_record? == false
+        puts "#{name} is not a ActiveRecord descend! Skipping!"
+        next
+      end
+      puts "Creating a factory for a #{name}"
+      file = File.new("./spec/factories/#{name.pluralize}.rb", File::CREAT|File::TRUNC|File::RDWR, 0644)
+      obj = name.camelize.constantize
+      file.puts "FactoryGirl.define do"
+      file.puts <<-RUBY
+  factory :#{name} do
+#{factory_attributes(obj, name).gsub(/^/, "    ")}
+  end
+end
+  RUBY
+      file.close
+    else
+      puts "The factory for a #{name} exists, skipping..."
+    end
+  end
+end
+
+def factory_attributes(obj, name)
+  # Generate a string overview of needed attributes
+  # We don't need the fields with a id
+  columns = obj.columns.delete_if{|col| col.name =~ /id$/}
+  attributes = []
+  sub_factories = []
+
+  # Step over the columns and add to the attributes for factory
+  columns.each do |col|
+    case col.type
+    when :string
+      # Determin subtype
+      if col.name =~ /email/i
+        attributes << "#{col.name} { FFaker::Internet.email }"
+        next
+      end
+      if col.name =~ /_ip$|ip_adress$/i
+        attributes << "#{col.name} { FFaker::Internet.ip_v4_address }"
+        next
+      end
+      if col.name =~ /_url$/i
+        attributes << "#{col.name} { FFaker::Internet.http_url }"
+        next
+      end
+      next if col.name =~ /token$|content_type$|file/
+
+      attributes << "#{col.name} { FFaker::Lorem.phrase }"
+    when :integer
+      next if col.name =~ /file_size$/
+      if col.name =~ /_id$/i # Belongs_to user == user_id -> user
+        attributes << "#{col.name.gsub(/_id$/i, '')}"
+        next
+      end
+      attributes << "#{col.name} { rand(99) }"
+    when :float
+      attributes << "#{col.name} { rand + rand(6) }"
+    when :date, :datetime
+      next if col.name =~ /_at$/i
+      attributes << "#{col.name} { FFaker::Time.date }"
+    when :boolean
+      attributes << "#{col.name} { [true, false, true, false, true, false, true, false].sample }"
+    else
+      attributes << "# #{col.name} TODO unknown field #{col.name} !"
+    end
+  end
+
+  # Map all attributes
+  obj.reflections.each{|key, val|
+    #assoc kind e.d.
+    assoc = obj.reflections[key]
+    case assoc.macro
+    when :has_many
+      next if name == key #ignore self ref!
+      sub_factories << <<-RUBY
+  factory :#{name}_with_#{key.to_s} do
+    transient do
+      #{key}_count 3
+    end
+
+    after(:create) do |#{name}, evaluator|
+      FactoryGirl.create_list(:#{key.to_s.singularize}, evaluator.#{key.to_s}_count, #{key.to_s.singularize}: #{key.to_s.singularize.camelize})
+    end
+  end
+RUBY
+    when :has_one, :belongs_to
+      attributes << key
+    end
+  }
+  # We need to add the subfactories as wel
+  attributes << sub_factories.join("\n").strip
+  return attributes.join("\n")
+end
+
+def generate_specs
+  files = Dir.glob('./app/models/*.rb')
+  files.each do |f|
+    name = f.split('/').last.gsub('.rb','')
+    unless File.exists?("./spec/models/#{name}_spec.rb") || name.camelize.end_with?('Import')
+      puts "Creating spec for #{name.camelize}"
+      m = name.camelize.constantize
+      if m.respond_to?(:descends_from_active_record?) == false || m.descends_from_active_record? == false
+        puts "#{name} is not a ActiveRecord descend! Skipping!"
+        next
+      end
+      specfile = File.new("./spec/models/#{name}_spec.rb", File::CREAT|File::TRUNC|File::RDWR, 0644)
+      specfile.puts "require 'rails_helper'"
+      specfile.puts "# TODO Write a good test for #{name.split('_').join(' ')}"
+      #Parse the file so we can fill in a skeleton file...
+      specfile.puts
+      specfile.puts "describe #{name.camelize} do"
+      begin
+        specfile.puts "\tsubject(:#{name}) { FactoryGirl.build_stubbed(:#{name}) }"
+        specfile.puts
+        specfile.puts "\t# The relations..."
+        specfile.puts "\tdescribe 'relations' do"
+        if m.reflections
+          m.reflections.each{|key, val|
+            #assoc kind e.d.
+            assoc = m.reflections[key]
+            if assoc.macro == :has_many
+              specfile.puts "\t\tit { should have_many(:#{key})#{val.options && val.options[:dependent] ? ".dependent(:#{val.options[:dependent]})" : '' }#{val.options && val.options[:through] ? ".through(:#{val.options[:through]})" : '' } }"
+            end
+            if assoc.macro == :belongs_to
+              specfile.puts "\t\tit { should belong_to(:#{key}) }"
+            end
+            if assoc.macro == :has_and_belongs_to_many
+              specfile.puts "\t\tit { should have_and_belong_to_many(:#{key}) }"
+            end
+            if assoc.macro == :has_one
+              specfile.puts "\t\tit { should have_one(:#{key}) }"
+            end
+          }
+        end
+        specfile.puts "\tend"
+        specfile.puts "\n\t# The validations. If any."
+        specfile.puts "\tdescribe 'validations' do"
+        if m.validators
+          m.validators.each do |val|
+            if val.class == ActiveModel::Validations::PresenceValidator
+              val.attributes.each do |at|
+                specfile.puts "\t\tit { should validate_presence_of(:#{at}) }"
+              end
+            end
+            if val.class == ActiveRecord::Validations::UniquenessValidator
+              val.attributes.each do |at|
+                specfile.puts "\t\tsubject { FactoryGirl.build(:#{name}) }"
+                specfile.puts "\t\tit { should validate_uniqueness_of(:#{at}) }"
+              end
+            end
+            if val.class == ActiveModel::Validations::ConfirmationValidator
+              val.attributes.each do |at|
+                specfile.puts "\t\tit { should validate_acceptance_of(:#{at}) }"
+              end
+            end
+          end
+        end
+        specfile.puts "\tend"
+
+        specfile.puts "\n\t# See to the correct use of the DB..."
+        specfile.puts "\tdescribe 'raw table' do\n"
+        #Best practices!
+        m.attribute_names.each do |att|
+          # specfile.puts "\t\tit { should have_db_column(:#{att}) }"
+          if att.ends_with?("_id")
+            specfile.puts "\t\tit { should have_db_index(:#{att}) }"
+          end
+          if att.end_with?("_type") && !att.end_with?('content_type')
+            specfile.puts "\t\tit { should have_db_index([:#{att.gsub('_type', '_id')}, :#{att}]) }"
+          end
+        end
+        specfile.puts "\n\tend"
+      rescue
+        puts "There was an error while proccessing #{name.camelize}. Maybe not a ActiveRecord::Base desendent?"
+        puts "The error was: #{$!.inspect}"
+      ensure
+        specfile.puts "end"
+        specfile.close
+      end
+    else
+      puts "Spec for #{name} exists! Skipping..."
+    end
+  end
+end
+
+def setup_directories
+  `mkdir -p spec/models/`
+  `mkdir -p spec/support/`
+  `mkdir -p spec/factories/`
+end
+
+# now execute the code above
+@bundle_need = @gemfile_newline_checked = false
+init_bundler_rspec
+init_bundler_fg
+if @bundle_need
+  puts 'Installing gems'
+  `bundle install`
+end
+# Create rspec and factory_girl info
+`rails g rspec:install`
+setup_directories
+init_factory_girl
+# Generate factories and specs
+require './config/environment.rb'
+generate_factories
+generate_specs
